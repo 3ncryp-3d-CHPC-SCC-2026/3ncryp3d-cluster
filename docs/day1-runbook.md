@@ -1,6 +1,10 @@
 # Day 1 runbook: from boxes to a working cluster
 
-For the three HPE ProLiant DL325 Gen11 servers in the final BOM. Work top to
+For the three HPE ProLiant DL325 Gen11 servers in the final BOM.
+
+**When:** hardware collection is **Sunday 6 Dec, 19:00**, and HPL, HPCG and
+IO500 are due **Monday 17:50**. Steps 1-8 and the benchmark builds have to be
+done on Sunday night. Bring the offline bundle from `tools/fetch_sources.sh`. Work top to
 bottom; tick each box. Times are estimates. Anything marked **(verify)** is a
 menu name or default that can differ by firmware version: check on the day.
 

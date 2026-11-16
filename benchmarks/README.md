@@ -1,4 +1,10 @@
-# Benchmarks: HPL, HPCG, HPCC on 3x EPYC 9135
+# Benchmarks: HPL, HPCG (and IO500) on 3x EPYC 9135
+
+Monday 7 Dec, due 17:50. Scoring (scc-nationals26, 2026-11-09): **HPL 7%,
+HPCG 7%, IO500 6%**. HPCC was **removed** from scoring on 2026-11-09, but the
+PDF timetable still lists it, so confirm with the organisers. HPCC stays here as a
+fallback only. IO500 lives in [`io500/`](io500/). Full schedule:
+[`docs/competition-plan.md`](../docs/competition-plan.md).
 
 Build once on a compute node, install to the NFS share, run from node3.
 

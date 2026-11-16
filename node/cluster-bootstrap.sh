@@ -237,6 +237,9 @@ table inet filter {
   }
   chain forward {
     type filter hook forward priority 0; policy drop;
+    # node1/node2 must never reach the cloud metadata service through
+    # node3's NAT: node3's user-data holds the internal cluster SSH key
+    ip daddr 169.254.169.254 drop
     iifname != \$UPLINK oifname \$UPLINK accept
     iifname \$UPLINK ct state established,related accept
     # mesh <-> mesh: lets node1<->node2 traffic fail over through node3
@@ -247,6 +250,7 @@ table inet filter {
     # user-data holds the internal cluster SSH key: only root may read
     # the metadata service
     ip daddr 169.254.169.254 meta skuid != 0 drop
+    ip6 daddr fe80::a9fe:a9fe meta skuid != 0 drop
   }
 }
 table ip nat {

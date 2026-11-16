@@ -1,2 +1,7 @@
 state/
 cluster.env
+tools/ilo.env
+results/
+benchmarks/build/
+benchmarks/runs/
+__pycache__/

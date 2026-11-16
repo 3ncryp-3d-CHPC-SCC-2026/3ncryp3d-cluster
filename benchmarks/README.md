@@ -93,11 +93,9 @@ Watch `tools/power-monitor.sh` output during long runs: anything at or over
 
 ## Applications (not scripted yet)
 
-- **HemePure:** CMake build with MPI; needs ParMETIS/METIS. Build into
-  `/mnt/shared/opt/apps`, run from `/mnt/shared` so all ranks see the input.
-- **AMBER:** AmberTools is free; the GPU-less `pmemd.MPI` build needs an
-  Amber licence, so confirm with the organisers what is provided. GCC 13 is
-  supported (report, p.3).
-- **OpenFOAM:** the openfoam.org/openfoam.com Ubuntu packages are the fastest
-  route; a source build with `-march=native` is a later optimisation.
-  Decompose (`decomposePar`) to 48 subdomains to match the ranks.
+The National Round apps are SPECFEM3D Cartesian v4.1.1 and ECSim/OPEM v1.4
+(Tue), WRF, llama.cpp v0.6.0 and MATLAB (Wed), and ExaHyPE 2 (Thu). Pinned
+versions, rules and prep for each are in
+[`docs/competition-plan.md`](../docs/competition-plan.md). Build them into
+`/mnt/shared/opt/apps` and run from `/mnt/shared` so all ranks see the inputs.
+`tools/fetch_sources.sh` caches every source offline.

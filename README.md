@@ -59,6 +59,12 @@ then `sudo baremetal/install.sh nodeN.env cluster_ed25519` on node3 first,
 then node1 and node2. Mesh links use MTU 9000 there. Steps are at the top of
 `install.sh`.
 
+## More
+
+- [`docs/day1-runbook.md`](docs/day1-runbook.md): unboxing, cabling, iLO, BIOS, RAID, Ubuntu, bring-up, checklists
+- [`benchmarks/`](benchmarks/): HPL / HPCG / HPCC build (AMD BLIS zen5), sizing, runs, tuning order
+- [`tools/power-monitor.sh`](tools/power-monitor.sh): per-node watts and temperatures from iLO during runs, 75 C warning
+
 ## Files
 
 - `create_cluster.sh`: networks, ports, volumes, servers, floating IP, then waits and verifies

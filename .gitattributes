@@ -4,3 +4,4 @@
 *.env.example text eol=lf
 *.docx binary
 *.pdf binary
+*.py text eol=lf

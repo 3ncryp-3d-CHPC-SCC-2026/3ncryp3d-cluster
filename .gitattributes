@@ -5,3 +5,4 @@
 *.docx binary
 *.pdf binary
 *.py text eol=lf
+tests/openstack-dryrun/fake-* text eol=lf

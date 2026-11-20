@@ -46,12 +46,34 @@ die()  { printf '\033[1;31mERROR:\033[0m %s\n' "$*" >&2; exit 1; }
 # shellcheck source=cluster.env.example
 . "$CONFIG"
 
-for cmd in openstack ssh ssh-keygen base64 awk; do
+# Defaults for every setting, so a cluster.env that only lists what it
+# changes still works (values match cluster.env.example).
+: "${PREFIX:=3n3d}" "${IMAGE:=Ubuntu-24.04}"
+: "${FLAVOR_COMPUTE:=m1.xlarge}" "${FLAVOR_HEAD:=m1.xlarge}"
+: "${EXTERNAL_NETWORK:=public}" "${VENUE_CIDR:=192.168.30.0/24}" "${DNS_SERVERS:=8.8.8.8 1.1.1.1}"
+: "${VENUE_NETWORK:=}" "${ALLOWED_SSH_CIDR:=}" "${REPORT_VIA:=ssh}"
+: "${SSH_PUBLIC_KEY_FILE:=$HOME/.ssh/id_ed25519.pub}" "${SSH_PRIVATE_KEY_FILE:=$HOME/.ssh/id_ed25519}"
+: "${LINK_12_CIDR:=10.0.12.0/24}" "${LINK_23_CIDR:=10.0.23.0/24}" "${LINK_31_CIDR:=10.0.31.0/24}"
+: "${MESH_PORT_SECURITY:=auto}"
+: "${SHARED_DISKS:=2}" "${SHARED_DISK_GB:=480}" "${SHARED_VOLUME_TYPE:=}"
+: "${LOCAL_DISKS:=2}" "${LOCAL_DISK_GB:=300}" "${LOCAL_VOLUME_TYPE:=}"
+: "${MIN_LINK_GBPS:=9}" "${MIN_NFS_MBPS:=600}" "${BOOTSTRAP_TIMEOUT_MIN:=40}"
+
+case "$REPORT_VIA" in
+  ssh) need=(openstack ssh ssh-keygen base64 awk) ;;
+  console) need=(openstack ssh-keygen base64 awk) ;;
+  *) die "REPORT_VIA must be 'ssh' or 'console' (got '$REPORT_VIA')" ;;
+esac
+for cmd in "${need[@]}"; do
   command -v "$cmd" >/dev/null || die "'$cmd' not found (pip install python-openstackclient for openstack)"
 done
-[[ -n "${ALLOWED_SSH_CIDR:-}" ]] || die "set ALLOWED_SSH_CIDR in $CONFIG (e.g. your.public.ip/32)"
-[[ "$ALLOWED_SSH_CIDR" != "0.0.0.0/0" ]] || warn "ALLOWED_SSH_CIDR is 0.0.0.0/0: node3 SSH open to the whole internet"
-[[ -r "$SSH_PUBLIC_KEY_FILE" ]] || die "SSH public key $SSH_PUBLIC_KEY_FILE not readable"
+if [[ "$REPORT_VIA" == ssh ]]; then
+  [[ -n "$ALLOWED_SSH_CIDR" ]] || die "set ALLOWED_SSH_CIDR in $CONFIG (e.g. your.public.ip/32), or use REPORT_VIA=console when no floating IP is available"
+  [[ "$ALLOWED_SSH_CIDR" != "0.0.0.0/0" ]] || warn "ALLOWED_SSH_CIDR is 0.0.0.0/0: node3 SSH open to the whole internet"
+  [[ -r "$SSH_PUBLIC_KEY_FILE" ]] || die "SSH public key $SSH_PUBLIC_KEY_FILE not readable"
+else
+  log "REPORT_VIA=console: no floating IP, no inbound access; results come back through node3's console log"
+fi
 
 STATE="$HERE/state/$PREFIX"
 mkdir -p "$STATE"
@@ -95,8 +117,12 @@ os limits show --absolute 2>/dev/null | grep -Ei 'Instances|Cores|RAM|Volume|Gig
 # ---------------------------------------------------------------------------
 log "Keypairs"
 KEYPAIR="${PREFIX}-key"
-if ! exists keypair show "$KEYPAIR"; then
-  os keypair create --public-key "$SSH_PUBLIC_KEY_FILE" "$KEYPAIR" >/dev/null
+KEY_ARGS=()
+if [[ -r "$SSH_PUBLIC_KEY_FILE" ]]; then
+  if ! exists keypair show "$KEYPAIR"; then
+    os keypair create --public-key "$SSH_PUBLIC_KEY_FILE" "$KEYPAIR" >/dev/null
+  fi
+  KEY_ARGS=(--key-name "$KEYPAIR")
 fi
 # Internal key for passwordless SSH between the nodes (stays in state/).
 if [[ ! -f "$STATE/cluster_ed25519" ]]; then
@@ -152,11 +178,16 @@ fi
 log "Venue uplink for node3"
 UPLINK_SG="${PREFIX}-uplink"
 if ! exists security group show "$UPLINK_SG"; then
-  os security group create "$UPLINK_SG" --description "3ncryp3d node3 uplink: SSH only" >/dev/null
-  os security group rule create "$UPLINK_SG" --ingress --protocol tcp --dst-port 22 \
-    --remote-ip "$ALLOWED_SSH_CIDR" >/dev/null
-  os security group rule create "$UPLINK_SG" --ingress --protocol icmp \
-    --remote-ip "$ALLOWED_SSH_CIDR" >/dev/null
+  if [[ "$REPORT_VIA" == ssh ]]; then
+    os security group create "$UPLINK_SG" --description "3ncryp3d node3 uplink: SSH only" >/dev/null
+    os security group rule create "$UPLINK_SG" --ingress --protocol tcp --dst-port 22 \
+      --remote-ip "$ALLOWED_SSH_CIDR" >/dev/null
+    os security group rule create "$UPLINK_SG" --ingress --protocol icmp \
+      --remote-ip "$ALLOWED_SSH_CIDR" >/dev/null
+  else
+    # console mode: outbound only (apt, NAT for node1/2), no inbound rules at all
+    os security group create "$UPLINK_SG" --description "3ncryp3d node3 uplink: egress only" >/dev/null
+  fi
 fi
 
 USE_FIP=0
@@ -164,7 +195,9 @@ if [[ -n "${VENUE_NETWORK:-}" ]]; then
   VENUE_NET="$VENUE_NETWORK"
   exists network show "$VENUE_NET" || die "VENUE_NETWORK '$VENUE_NET' not found"
 else
-  USE_FIP=1
+  # Our own venue network + router (the router's external gateway gives
+  # outbound SNAT). A floating IP is only needed for inbound SSH.
+  [[ "$REPORT_VIA" == ssh ]] && USE_FIP=1
   VENUE_NET="${PREFIX}-venue"
   exists network show "$VENUE_NET" || os network create "$VENUE_NET" >/dev/null
   if ! exists subnet show "${VENUE_NET}-subnet"; then
@@ -255,6 +288,7 @@ done
 log "Cloud-init user-data per node"
 BOOT_B64="$(b64 "$HERE/node/cluster-bootstrap.sh")"
 VERIFY_B64="$(b64 "$HERE/node/verify-cluster.sh")"
+REPORT_B64="$(b64 "$HERE/node/console-report.sh")"
 KEY_B64="$(b64 "$STATE/cluster_ed25519")"
 PUB_B64="$(b64 "$STATE/cluster_ed25519.pub")"
 
@@ -321,11 +355,17 @@ LINKS=\"$(mac "$P_N3_23")|10.0.23.3/24|node2|10.0.23.2 $(mac "$P_N3_31")|10.0.31
 HOSTS=\"10.0.31.1|node1 10.0.23.2|node2 10.0.31.3|node3\"
 NFS_CLIENTS=\"10.0.31.1 10.0.23.2\"
 LOCAL_VOLUMES=\"${LOCAL_VOLS[node3]}\"
-SHARED_VOLUMES=\"${SHARED_VOLS}\"" "$STATE/node3.yaml" \
+SHARED_VOLUMES=\"${SHARED_VOLS}\"
+REPORT_VIA=${REPORT_VIA}
+BOOTSTRAP_TIMEOUT_MIN=${BOOTSTRAP_TIMEOUT_MIN}" "$STATE/node3.yaml" \
 "  - path: /usr/local/bin/verify-cluster.sh
     permissions: '0755'
     encoding: b64
     content: ${VERIFY_B64}
+  - path: /usr/local/sbin/console-report.sh
+    permissions: '0755'
+    encoding: b64
+    content: ${REPORT_B64}
   - path: /etc/cluster/targets.env
     permissions: '0644'
     encoding: b64
@@ -340,7 +380,7 @@ make_server() {
   for p in "$@"; do ports+=(--port "$p"); done
   if ! exists server show "${PREFIX}-${name}"; then
     os server create "${PREFIX}-${name}" --image "$IMAGE" --flavor "$flavor" \
-      --key-name "$KEYPAIR" --config-drive True --user-data "$ud" \
+      "${KEY_ARGS[@]}" --config-drive True --user-data "$ud" \
       "${ports[@]}" --wait >/dev/null
   fi
   [[ "$(val server show "${PREFIX}-${name}" -c status)" == ACTIVE ]] \
@@ -407,6 +447,42 @@ EOF
 log "node3 is at ${NODE3_ADDR}; ssh config written to $SSHCFG"
 
 # ---------------------------------------------------------------------------
+if [[ "$REPORT_VIA" == console ]]; then
+  # node3 waits for node1/node2, runs verify-cluster.sh and prints the result
+  # to its serial console between markers (node/console-report.sh). Reading
+  # the console log is an API call, so no network path to node3 is needed.
+  # node3 waits up to BOOTSTRAP_TIMEOUT_MIN for the others, so allow 15 min
+  # more for its own setup.
+  log "Waiting for node3's report on its console log (up to $((BOOTSTRAP_TIMEOUT_MIN + 15)) min)"
+  deadline=$(( $(date +%s) + (BOOTSTRAP_TIMEOUT_MIN + 15) * 60 ))
+  while :; do
+    clog="$(openstack console log show "${PREFIX}-node3" 2>/dev/null || true)"
+    if grep -q '3N3D-REPORT-END' <<<"$clog"; then break; fi
+    if (( $(date +%s) > deadline )); then
+      warn "no report from node3 in time. Look at: openstack console log show ${PREFIX}-node3"
+      exit 1
+    fi
+    sleep 30
+  done
+  printf '%s\n' "$clog" > "$STATE/node3-console.log"
+  echo
+  # report lines are prefixed "3N3D| " so kernel messages in between are dropped
+  sed -n '/3N3D-REPORT-BEGIN/,/3N3D-REPORT-END/p' <<<"$clog" | grep '^3N3D| ' | cut -c7-
+  rc="$(grep -o '3N3D-REPORT-END rc=[0-9a-z-]*' <<<"$clog" | tail -1 | cut -d= -f2)"
+  log "full console log saved to $STATE/node3-console.log"
+  if [[ "$rc" != 0 ]]; then
+    warn "node3 reported rc=${rc} (FAILs or a failed bootstrap; see above)"
+    exit 1
+  fi
+  cat <<EOF
+
+Cluster is up and verify-cluster.sh passed (reported through node3's console).
+There is no inbound access in console mode: the cluster tests the build, not
+interactive work. Tear down: ./destroy_cluster.sh
+EOF
+  exit 0
+fi
+
 log "Waiting for first-boot setup on all nodes (up to ${BOOTSTRAP_TIMEOUT_MIN} min)"
 deadline=$(( $(date +%s) + BOOTSTRAP_TIMEOUT_MIN * 60 ))
 for n in node3 node1 node2; do

@@ -24,6 +24,28 @@ if [[ -f "$DONE" ]]; then
   exit 0
 fi
 
+# Console mode (no floating IP): if node3's own setup fails, say so on the
+# serial console, where create_cluster.sh is watching for the report.
+console_fail() {
+  [[ "${REPORT_VIA:-ssh}" == console && "$ROLE" == head ]] || return 0
+  local t
+  for t in /dev/ttyS0 /dev/console; do
+    [[ -w "$t" ]] || continue
+    {
+      echo "3N3D-REPORT-BEGIN $(date -Is)"
+      echo "3N3D| node3 first-boot setup FAILED (exit $1). Last lines of $LOG:"
+      tail -n 30 "$LOG" | sed 's/^/3N3D| /'
+      echo "3N3D-REPORT-END rc=bootstrap-failed"
+    } >> "$t"
+    return 0
+  done
+}
+on_exit() {
+  local rc=$?
+  (( rc == 0 )) || console_fail "$rc"
+}
+trap on_exit EXIT
+
 log "bootstrapping ${NODE_NAME} (role=${ROLE})"
 
 # ---------------------------------------------------------------------------
@@ -383,3 +405,12 @@ fi
 
 date -Is > "$DONE"
 log "bootstrap of ${NODE_NAME} complete"
+
+# Console mode: node3 waits for the others, runs the checks and reports them on
+# its console. Run in the background so cloud-init can finish.
+if [[ "$ROLE" == "head" && "${REPORT_VIA:-ssh}" == console ]]; then
+  if ! systemd-run --unit=cluster-console-report --no-block /usr/local/sbin/console-report.sh; then
+    nohup /usr/local/sbin/console-report.sh >/dev/null 2>&1 &
+  fi
+  log "console report started (waits up to ${BOOTSTRAP_TIMEOUT_MIN:-40} min for node1/node2)"
+fi

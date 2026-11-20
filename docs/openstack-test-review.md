@@ -16,7 +16,7 @@ tests/openstack-dryrun/run.sh
 
 ## Verdict
 
-**Not safe to run as written.** Two problems stop it. The design itself is fine:
+**Not safe to run as written.** Two problems stop it (both now handled: see "Update" below). The design itself is fine:
 topology, MTU, sizing and the no-floating-IP path all check out.
 
 ## Blocking problems
@@ -94,6 +94,63 @@ change first. Either:
 - set a console password through cloud-init so the Horizon console works.
 
 The second option weakens security. Decide before changing anything.
+
+## Update: the no-floating-IP route is now built (`REPORT_VIA=console`)
+
+No extra floating IP is available (the admin is away), so `create_cluster.sh`
+now has a console mode. Both blockers above are dealt with:
+
+- **Blocker 1 fixed for every mode:** `create_cluster.sh` gives every
+  setting a default (the same values as `cluster.env.example`), so a short
+  `cluster.env` that lists only what it changes no longer crashes.
+- **Blocker 2 avoided with `REPORT_VIA="console"`:**
+  - The script needs no floating IP, no `ALLOWED_SSH_CIDR` and no SSH key, and
+    node3's uplink security group has **no inbound rules at all**.
+  - With `VENUE_NETWORK` empty it still builds its own router, which gives
+    outbound internet only (apt, NAT for node1/node2). The plan's manual
+    router commands (its section 6) are no longer needed.
+  - When node3 finishes setting itself up, `node/console-report.sh` waits for
+    node1 and node2, runs `verify-cluster.sh` as `ubuntu`, and prints the
+    result to node3's **serial console** between `3N3D-REPORT-BEGIN` and
+    `3N3D-REPORT-END rc=N` markers. Each line is prefixed `3N3D| `, so kernel
+    messages in between are dropped.
+  - `create_cluster.sh` reads that with `openstack console log show`, which is
+    an API call and needs no network path to the VM. It prints the checks, saves
+    the full console log in `state/<prefix>/node3-console.log`, and exits 0 only
+    if there were no FAILs.
+  - If node3's own setup fails, it reports `rc=bootstrap-failed` with the last
+    30 lines of its log, so the script doesn't sit waiting.
+  - The console log is visible to project members, so only check results and
+    log lines are printed, never keys.
+- **Trade-off:** there is no interactive shell. This mode tests that the build
+  and the software stack come up and pass the checks. It is not for running
+  benchmarks by hand.
+
+`cluster.env` for Sebowa (anything not listed uses the default):
+
+```bash
+PREFIX="3n3d-test"
+IMAGE="Ubuntu 24.04"
+FLAVOR_COMPUTE="C6.small"
+FLAVOR_HEAD="C6.small"
+EXTERNAL_NETWORK="Public Internet"
+REPORT_VIA="console"
+SHARED_DISKS=2 ; SHARED_DISK_GB=25
+LOCAL_DISKS=2  ; LOCAL_DISK_GB=15
+```
+
+Dry-run results (`tests/openstack-dryrun/run.sh`, scenarios 4-7; about 2 minutes on Windows Git Bash):
+
+| Scenario | Result |
+|---|---|
+| node3 reports all checks passed | prints the checks, exit 0; no floating IP, 0 inbound rules, no keypair, 1 router (egress) |
+| node3 reports a FAIL | prints the FAIL, exit 1 |
+| node3's own setup failed | prints the failure note, exit 1 |
+| `console-report.sh` on a sandboxed node3 | writes BEGIN, the prefixed check lines and `END rc=0` to the console |
+
+Still to confirm on Sebowa with one read-only call before building: that the
+project may read console logs (`openstack console log show <any server we own>`).
+Nova allows this for project members by default.
 
 ## Not verified here (needs read-only OpenStack queries)
 

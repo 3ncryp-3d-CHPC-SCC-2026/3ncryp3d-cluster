@@ -1,0 +1,64 @@
+#!/bin/bash
+# fake-openstack - stands in for the real `openstack` CLI so create_cluster.sh
+# can be dry-run with no cloud calls. It mimics the Sebowa project as described
+# in the test-cluster handoff (2026-11-20): image "Ubuntu 24.04", flavor
+# C6.small (6 vCPU / 12 GB), tenant network MTU 8950, a pre-created network
+# "3n3d-test-venue", and no free floating IPs. Every call is logged to
+# $MOCK_ST/calls.log; created resources are remembered as files in $MOCK_ST.
+set -uo pipefail
+ST="${MOCK_ST:?set MOCK_ST to a scratch directory}"
+echo "openstack $*" >> "$ST/calls.log"
+
+key() { printf '%s_%s' "$1" "$2" | tr ' /' '__'; }
+# value of the "-c <column>" argument, if any
+col=""
+args=("$@")
+for ((i = 0; i < ${#args[@]}; i++)); do
+  [[ "${args[i]}" == -c ]] && col="${args[i+1]:-}"
+done
+last="${args[${#args[@]}-1]}"
+
+case "$1 ${2:-}" in
+  "token issue") exit 0 ;;
+  "image show") [[ "$3" == "Ubuntu 24.04" ]] ;;
+  "flavor show")
+    [[ "$3" == C6.small ]] || exit 1
+    case "$col" in vcpus) echo 6 ;; ram) echo 12288 ;; esac ;;
+  "limits show") printf '| maxTotalCores | 50 |\n| maxTotalRAMSize | 102400 |\n' ;;
+  "security group")
+    case "$3" in
+      show) [[ -f "$ST/$(key sg "$4")" ]] ;;
+      create) touch "$ST/$(key sg "$4")" ;;
+      *) exit 0 ;;
+    esac ;;
+  "keypair show"|"subnet show"|"router show") [[ -f "$ST/$(key "$1" "$3")" ]] ;;
+  "keypair create") touch "$ST/$(key keypair "$last")" ;;
+  "subnet create"|"router create") touch "$ST/$(key "$1" "$3")" ;;
+  "router set"|"router add") exit 0 ;;
+  "network show")
+    [[ "$3" == 3n3d-test-venue || -f "$ST/$(key network "$3")" ]] || exit 1
+    case "$col" in mtu) echo 8950 ;; port_security_enabled) echo False ;; esac ;;
+  "network create") touch "$ST/$(key network "$last")" ;;
+  "port show")
+    name="${3#id-}"
+    [[ -f "$ST/$(key port "$name")" ]] || exit 1
+    case "$col" in
+      id) echo "id-$name" ;;
+      mac_address) printf 'fa:16:3e:%02x:%02x:%02x\n' $((RANDOM % 256)) $((RANDOM % 256)) $((RANDOM % 256)) ;;
+      fixed_ips) echo "[{'subnet_id': 'x', 'ip_address': '192.168.30.57'}]" ;;
+    esac ;;
+  "port create") touch "$ST/$(key port "$last")" ;;
+  "port set") exit 0 ;;
+  "volume show")
+    [[ -f "$ST/$(key volume "$3")" ]] || exit 1
+    case "$col" in id) echo "$3" ;; status) echo available ;; esac ;;
+  "volume create") touch "$ST/$(key volume "$last")" ;;
+  "server show")
+    [[ -f "$ST/$(key server "$3")" ]] || exit 1
+    [[ "$col" == status ]] && echo ACTIVE
+    exit 0 ;;
+  "server create") touch "$ST/$(key server "$3")" ;;
+  "server add") exit 0 ;;
+  "floating ip") echo "FIP REQUESTED: $*" >> "$ST/calls.log"; exit 1 ;;
+  *) echo "UNHANDLED: $*" >> "$ST/calls.log"; exit 0 ;;
+esac

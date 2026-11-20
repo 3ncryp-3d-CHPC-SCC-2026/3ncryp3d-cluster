@@ -1,0 +1,5 @@
+#!/bin/bash
+# fake-ssh - the laptop cannot reach node3's private venue address when the
+# cluster has no floating IP, so every connection attempt fails.
+echo "ssh $*" >> "${MOCK_ST:?}/calls.log"
+exit 255

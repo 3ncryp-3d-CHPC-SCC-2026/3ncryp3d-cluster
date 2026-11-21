@@ -22,7 +22,9 @@ t="$tmp/team"
 mkdir -p "$t/keys/ssh" "$t/keys/wg" "$t/users" "$t/hostkeys" "$t/hostkey" "$t/wg" "$t/bin"
 
 cp "$HERE/config/team.conf" "$t/team.conf"
-install -m 755 "$HERE/node/team-setup.sh" "$HERE/node/team-key" "$t/bin/"
+install -m 755 "$HERE/node/team-setup.sh" "$HERE/node/team-key" "$HERE/node/perf-mode" "$t/bin/"
+# Linux performance settings (perf-mode reads them on every boot)
+cp "$HERE/config/tuning.conf" "$t/tuning.conf"
 cp "$SECRETS"/users/* "$t/users/"
 shopt -s nullglob
 for f in "$HERE"/keys/ssh/*.pub; do cp "$f" "$t/keys/ssh/"; done

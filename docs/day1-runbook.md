@@ -53,6 +53,8 @@ files change, not the cables.
 
 ## 4. BIOS settings (10 min per node)
 
+**Faster: script it from the laptop for all three at once:** `laptop\bios-profile.ps1` (two passes, checked against each server's own settings list; see [`performance.md`](performance.md)). The manual steps below are the fallback.
+
 Use F9 System Utilities > System Configuration > BIOS/Platform Configuration (RBSU).
 
 - [ ] **Workload Profile:** start with **High Performance Compute (HPC)** **(verify name)**. It sets power regulator, C-states and determinism for throughput.

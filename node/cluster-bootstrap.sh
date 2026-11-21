@@ -475,6 +475,19 @@ if [[ -x "$TEAM_DIR/bin/team-setup.sh" ]]; then
   "$TEAM_DIR/bin/team-setup.sh"
 fi
 
+# ---------------------------------------------------------------------------
+# 9. Performance mode (config/tuning.conf via the bundle): saves Ubuntu's own
+#    values first, then applies PERF_MODE_DEFAULT and re-applies it every boot.
+#    Kernel options (mitigations=off) take effect after the next reboot.
+# ---------------------------------------------------------------------------
+if [[ -x "$TEAM_DIR/bin/perf-mode" && -f "$TEAM_DIR/tuning.conf" ]]; then
+  install -m 644 "$TEAM_DIR/tuning.conf" /etc/cluster/tuning.conf
+  install -m 755 "$TEAM_DIR/bin/perf-mode" /usr/local/sbin/perf-mode
+  /usr/local/sbin/perf-mode install
+  mode="$(sed -n 's/^PERF_MODE_DEFAULT=//p' /etc/cluster/tuning.conf)"
+  /usr/local/sbin/perf-mode "${mode:-performance}" || log "WARN: perf-mode ${mode:-performance} failed (see above)"
+fi
+
 date -Is > "$DONE"
 log "bootstrap of ${NODE_NAME} complete"
 

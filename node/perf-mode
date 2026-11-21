@@ -1,0 +1,452 @@
+#!/bin/bash
+# perf-mode - switch a 3ncryp+3d node between "performance" and "default"
+# (what Ubuntu does on this machine out of the box), and show what is in effect.
+#
+#   perf-mode status [--check]      item by item: wanted / now / OK|DIFF|PENDING
+#                                   (--check: exit 1 if anything is not OK)
+#   sudo perf-mode performance      apply config/tuning.conf
+#   sudo perf-mode default          put back the values saved at install
+#   sudo perf-mode dropcaches       flush page cache (before IO500 runs)
+#   add --all to run on all three nodes (as a team member with sudo)
+#
+# Internal: perf-mode install (once, by cluster-bootstrap.sh), perf-mode boot
+# (systemd, every boot: re-applies the saved mode).
+# Settings: /etc/cluster/tuning.conf. Saved defaults: /etc/cluster/perf-defaults.
+set -euo pipefail
+
+CONF=/etc/cluster/tuning.conf
+DEFAULTS=/etc/cluster/perf-defaults
+STATE=/etc/cluster/perf-mode-state
+GRUB_DROPIN=/etc/default/grub.d/90-3ncryp3d.cfg
+NFSD_DROPIN=/etc/nfs.conf.d/90-3ncryp3d.conf
+LIMITS=/etc/security/limits.d/90-3ncryp3d.conf
+UNIT=/etc/systemd/system/3ncryp3d-perf.service
+
+[[ -r "$CONF" ]] || { echo "perf-mode: $CONF not found" >&2; exit 1; }
+# shellcheck source=../config/tuning.conf
+. "$CONF"
+NODE_ENV=/etc/cluster/node.env
+ROLE=""; NODE_NAME="$(hostname)"
+# shellcheck source=/dev/null
+[[ -r "$NODE_ENV" ]] && . "$NODE_ENV"
+
+die() { echo "perf-mode: $*" >&2; exit 1; }
+note() { echo "  $*"; }
+need_root() { [[ $EUID -eq 0 ]] || die "use sudo"; }
+
+# ---------------------------------------------------------------------------
+# what this machine has
+# ---------------------------------------------------------------------------
+cpus() { ls -d /sys/devices/system/cpu/cpu[0-9]* 2>/dev/null; }
+cpu0=/sys/devices/system/cpu/cpu0
+boost_file() {
+  local f
+  for f in /sys/devices/system/cpu/cpufreq/boost /sys/devices/system/cpu/amd_pstate/cpb_boost; do
+    [[ -w "$f" || -r "$f" ]] && { echo "$f"; return; }
+  done
+  return 0
+}
+mesh_ifaces() { ip -o -4 addr show 2>/dev/null | awk '$4 ~ /^10\.0\./ {print $2}' | sort -u; }
+disks() { # real block devices that have a scheduler
+  local d
+  for d in /sys/block/*; do
+    [[ -f "$d/queue/scheduler" ]] || continue
+    case "$(basename "$d")" in loop*|ram*|zram*|sr*|md*|dm-*) continue ;; esac
+    basename "$d"
+  done
+}
+shared_dev() { # device behind /mnt/shared, and the disks under it
+  local src
+  src="$(findmnt -no SOURCE /mnt/shared 2>/dev/null || true)"
+  [[ -n "$src" && -b "$src" ]] || return 0
+  readlink -f "$src"
+}
+sched_now() { sed -n 's/.*\[\(.*\)\].*/\1/p' "/sys/block/$1/queue/scheduler"; }
+ring_now() { # ring_now <if> <rx|tx> <current|max>
+  local sect="Current hardware settings"
+  [[ "$3" == max ]] && sect="Pre-set maximums"
+  ethtool -g "$1" 2>/dev/null | awk -v s="$sect" -v k="${2^^}:" '
+    index($0, s) {f=1; next}
+    f && /settings|maximums/ {f=0}
+    f && $1 == k {print $2; exit}'
+}
+unit_exists() { [[ -n "$(systemctl list-unit-files --no-legend "$1" 2>/dev/null)" ]]; }
+cmdline_want() {
+  local w=""
+  [[ "${MITIGATIONS:-on}" == off ]] && w="mitigations=off"
+  [[ -n "${KERNEL_CMDLINE_EXTRA:-}" ]] && w+="${w:+ }$KERNEL_CMDLINE_EXTRA"
+  echo "$w"
+}
+
+# ---------------------------------------------------------------------------
+# install: save Ubuntu's own values once, so "default" really means default
+# ---------------------------------------------------------------------------
+save_defaults() {
+  [[ -f "$DEFAULTS" ]] && return 0
+  local u i d f v
+  # kv NAME VALUE: one safely quoted line per value (a value can never become a command)
+  kv() { printf '%s=%q\n' "$1" "$(head -n1 <<<"$2")"; }
+  first() { cat "$1" 2>/dev/null || true; }
+  {
+    echo "# perf-mode: values found on $(hostname) at install ($(date -Is)). Do not edit."
+    kv D_GOVERNOR "$(first "$cpu0/cpufreq/scaling_governor")"
+    kv D_EPP "$(first "$cpu0/cpufreq/energy_performance_preference")"
+    f="$(boost_file)"; kv D_BOOST "$( [[ -n "$f" ]] && first "$f")"
+    kv D_THP_ENABLED "$(sed -n 's/.*\[\(.*\)\].*/\1/p' /sys/kernel/mm/transparent_hugepage/enabled)"
+    kv D_THP_DEFRAG "$(sed -n 's/.*\[\(.*\)\].*/\1/p' /sys/kernel/mm/transparent_hugepage/defrag)"
+    kv D_NUMA_BALANCING "$(sysctl -n kernel.numa_balancing 2>/dev/null || echo 0)"
+    kv D_SWAPPINESS "$(sysctl -n vm.swappiness)"
+    kv D_NMI_WATCHDOG "$(sysctl -n kernel.nmi_watchdog 2>/dev/null || echo 0)"
+    kv D_RMEM_MAX "$(sysctl -n net.core.rmem_max)"
+    kv D_WMEM_MAX "$(sysctl -n net.core.wmem_max)"
+    kv D_TCP_RMEM "$(sysctl -n net.ipv4.tcp_rmem | tr -s '\t ' ' ')"
+    kv D_TCP_WMEM "$(sysctl -n net.ipv4.tcp_wmem | tr -s '\t ' ' ')"
+    kv D_BACKLOG "$(sysctl -n net.core.netdev_max_backlog)"
+    v="$(first /proc/fs/nfsd/threads)"; kv D_NFSD_THREADS "${v:-8}"
+    for i in $(mesh_ifaces); do
+      kv "D_RING_${i//[^A-Za-z0-9]/_}" "$(ring_now "$i" rx current) $(ring_now "$i" tx current)"
+    done
+    for d in $(disks); do
+      kv "D_SCHED_${d//[^A-Za-z0-9]/_}" "$(sched_now "$d")"
+      kv "D_RA_${d//[^A-Za-z0-9]/_}" "$(first "/sys/block/$d/queue/read_ahead_kb")"
+    done
+    d="$(shared_dev)"
+    [[ -n "$d" ]] && kv D_RA_SHARED "$(( $(blockdev --getra "$d") / 2 ))"
+    # shellcheck disable=SC2086
+    for u in ${QUIET_UNITS} irqbalance.service; do
+      unit_exists "$u" || continue
+      v="$(systemctl is-enabled "$u" 2>/dev/null)" || true
+      kv "D_UNIT_${u//[^A-Za-z0-9]/_}" "${v:-disabled}"
+    done
+  } > "$DEFAULTS"
+  chmod 644 "$DEFAULTS"
+}
+
+do_install() {
+  need_root
+  save_defaults
+  cat > "$LIMITS" <<EOF
+# 3ncryp+3d - written by perf-mode install (MPI and HPL need these)
+*    soft memlock ${LIMIT_MEMLOCK}
+*    hard memlock ${LIMIT_MEMLOCK}
+*    soft stack   ${LIMIT_STACK}
+*    hard stack   ${LIMIT_STACK}
+*    soft nofile  ${LIMIT_NOFILE}
+*    hard nofile  ${LIMIT_NOFILE}
+EOF
+  cat > "$UNIT" <<EOF
+[Unit]
+Description=3ncryp+3d performance mode (perf-mode)
+After=network-online.target nfs-server.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/perf-mode boot
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload 2>/dev/null || true
+  systemctl enable 3ncryp3d-perf.service >/dev/null 2>&1 || true
+  [[ -f "$STATE" ]] || echo "${PERF_MODE_DEFAULT:-performance}" > "$STATE"
+  echo "perf-mode installed on $(hostname) (saved defaults: $DEFAULTS)"
+}
+
+# ---------------------------------------------------------------------------
+# apply one mode
+# ---------------------------------------------------------------------------
+wr() { # wr <value> <file>: write if possible, never fail the run
+  [[ -n "$1" && -e "$2" ]] || return 0
+  echo "$1" > "$2" 2>/dev/null || true
+}
+sc() { sysctl -qw "$1=$2" >/dev/null 2>&1 || true; }
+
+apply_mode() { # performance | default
+  local mode="$1" c s n d i k v rx tx u f ra
+  need_root
+  [[ -f "$DEFAULTS" ]] || save_defaults
+  # shellcheck source=/dev/null
+  . "$DEFAULTS"
+  local perf=0; [[ "$mode" == performance ]] && perf=1
+
+  # CPU frequency, boost, idle states
+  local gov epp boost maxidle
+  if (( perf )); then gov="$CPU_GOVERNOR"; epp="$CPU_EPP"; boost="$CPU_BOOST"; maxidle="$CPU_MAX_IDLE_STATE"
+  else gov="${D_GOVERNOR:-}"; epp="${D_EPP:-}"; boost="${D_BOOST:-}"; maxidle=99; fi
+  for c in $(cpus); do
+    # EPP first: amd-pstate refuses EPP changes once the governor is "performance"
+    wr "$epp" "$c/cpufreq/energy_performance_preference"
+    wr "$gov" "$c/cpufreq/scaling_governor"
+    wr "$epp" "$c/cpufreq/energy_performance_preference"
+    for s in "$c"/cpuidle/state[0-9]*; do
+      [[ -d "$s" ]] || continue
+      n="${s##*state}"
+      if (( n > maxidle )); then wr 1 "$s/disable"; else wr 0 "$s/disable"; fi
+    done
+  done
+  f="$(boost_file)"; [[ -n "$f" ]] && wr "$boost" "$f"
+
+  # memory and kernel
+  if (( perf )); then
+    wr "$THP_ENABLED" /sys/kernel/mm/transparent_hugepage/enabled
+    wr "$THP_DEFRAG" /sys/kernel/mm/transparent_hugepage/defrag
+    sc kernel.numa_balancing "$NUMA_BALANCING"; sc vm.swappiness "$SWAPPINESS"
+    sc kernel.nmi_watchdog "$NMI_WATCHDOG"
+    sc net.core.rmem_max "$NET_RMEM_MAX"; sc net.core.wmem_max "$NET_WMEM_MAX"
+    sc net.ipv4.tcp_rmem "$NET_TCP_RMEM"; sc net.ipv4.tcp_wmem "$NET_TCP_WMEM"
+    sc net.core.netdev_max_backlog "$NET_BACKLOG"
+  else
+    wr "${D_THP_ENABLED:-}" /sys/kernel/mm/transparent_hugepage/enabled
+    wr "${D_THP_DEFRAG:-}" /sys/kernel/mm/transparent_hugepage/defrag
+    sc kernel.numa_balancing "${D_NUMA_BALANCING:-}"; sc vm.swappiness "${D_SWAPPINESS:-}"
+    sc kernel.nmi_watchdog "${D_NMI_WATCHDOG:-}"
+    sc net.core.rmem_max "${D_RMEM_MAX:-}"; sc net.core.wmem_max "${D_WMEM_MAX:-}"
+    sc net.ipv4.tcp_rmem "${D_TCP_RMEM:-}"; sc net.ipv4.tcp_wmem "${D_TCP_WMEM:-}"
+    sc net.core.netdev_max_backlog "${D_BACKLOG:-}"
+  fi
+
+  # NIC rings on the mesh links
+  for i in $(mesh_ifaces); do
+    if (( perf )) && [[ "$NET_RING_MAX" == 1 ]]; then
+      rx="$(ring_now "$i" rx max)"; tx="$(ring_now "$i" tx max)"
+    else
+      k="D_RING_${i//[^A-Za-z0-9]/_}"; v="${!k:-}"; rx="${v% *}"; tx="${v#* }"
+    fi
+    [[ "$rx" =~ ^[0-9]+$ && "$tx" =~ ^[0-9]+$ ]] && ethtool -G "$i" rx "$rx" tx "$tx" >/dev/null 2>&1 || true
+  done
+
+  # disks: scheduler by type, read-ahead on the shared array
+  for d in $(disks); do
+    if (( perf )); then
+      if [[ "$(cat "/sys/block/$d/queue/rotational")" == 0 ]]; then s="$SSD_SCHEDULER"; else s="$HDD_SCHEDULER"; fi
+    else
+      k="D_SCHED_${d//[^A-Za-z0-9]/_}"; s="${!k:-}"
+    fi
+    wr "$s" "/sys/block/$d/queue/scheduler"
+  done
+  d="$(shared_dev)"
+  if [[ -n "$d" ]]; then
+    if (( perf )); then ra="$READ_AHEAD_KB"; else ra="${D_RA_SHARED:-128}"; fi
+    blockdev --setra $(( ra * 2 )) "$d" 2>/dev/null || true
+  fi
+
+  # NFS server threads (head)
+  if [[ "$ROLE" == head ]]; then
+    if (( perf )); then
+      mkdir -p "$(dirname "$NFSD_DROPIN")"
+      printf '# 3ncryp+3d - perf-mode\n[nfsd]\nthreads=%s\n' "$NFSD_THREADS" > "$NFSD_DROPIN"
+      wr "$NFSD_THREADS" /proc/fs/nfsd/threads
+    else
+      rm -f "$NFSD_DROPIN"
+      wr "${D_NFSD_THREADS:-}" /proc/fs/nfsd/threads
+    fi
+  fi
+
+  # background services
+  # shellcheck disable=SC2086
+  for u in ${QUIET_UNITS}; do
+    unit_exists "$u" || continue
+    if (( perf )); then
+      systemctl disable --now "$u" >/dev/null 2>&1 || true
+    else
+      k="D_UNIT_${u//[^A-Za-z0-9]/_}"
+      [[ "${!k:-}" == enabled ]] && { systemctl enable --now "$u" >/dev/null 2>&1 || true; }
+    fi
+  done
+  if unit_exists irqbalance.service; then
+    if (( perf )) && [[ "$IRQBALANCE" == off ]]; then
+      systemctl disable --now irqbalance.service >/dev/null 2>&1 || true
+    elif [[ "${D_UNIT_irqbalance_service:-}" == enabled ]]; then
+      systemctl enable --now irqbalance.service >/dev/null 2>&1 || true
+    fi
+  fi
+
+  # kernel command line [reboot]
+  local want; want="$(cmdline_want)"
+  if (( perf )) && [[ -n "$want" ]]; then
+    mkdir -p "$(dirname "$GRUB_DROPIN")"
+    # shellcheck disable=SC2016  # $GRUB_CMDLINE_LINUX_DEFAULT is for grub to expand
+    printf '# 3ncryp+3d - perf-mode (needs a reboot)\nGRUB_CMDLINE_LINUX_DEFAULT="$GRUB_CMDLINE_LINUX_DEFAULT %s"\n' "$want" > "$GRUB_DROPIN.new"
+    if ! cmp -s "$GRUB_DROPIN.new" "$GRUB_DROPIN" 2>/dev/null; then
+      mv "$GRUB_DROPIN.new" "$GRUB_DROPIN"
+      if ! update-grub >/dev/null 2>&1; then
+        # remove it again, so the next run retries instead of thinking it's done
+        rm -f "$GRUB_DROPIN"
+        echo "perf-mode: WARN: update-grub failed; kernel options not set" >&2
+      fi
+    else
+      rm -f "$GRUB_DROPIN.new"
+    fi
+  elif [[ -f "$GRUB_DROPIN" ]]; then
+    rm -f "$GRUB_DROPIN"
+    update-grub >/dev/null 2>&1 || true
+  fi
+
+  echo "$mode" > "$STATE"
+}
+
+# ---------------------------------------------------------------------------
+# status
+# ---------------------------------------------------------------------------
+BAD=0
+row() { # row <item> <want> <have> [pending]
+  local st=OK
+  if [[ "$2" != "$3" ]]; then
+    if [[ "${4:-}" == pending ]]; then st=PENDING; else st=DIFF; fi
+    BAD=1
+  fi
+  printf '  %-30s %-22s %-22s %s\n' "$1" "${2:0:22}" "${3:0:22}" "$st"
+}
+
+do_status() {
+  local mode perf=0 c n s d k u i want have
+  mode="$(cat "$STATE" 2>/dev/null || echo "${PERF_MODE_DEFAULT:-performance}")"
+  [[ "$mode" == performance ]] && perf=1
+  # shellcheck source=/dev/null
+  [[ -f "$DEFAULTS" ]] && . "$DEFAULTS"
+  echo "== $(hostname): mode ${mode}  (kernel $(uname -r))"
+  printf '  %-30s %-22s %-22s %s\n' ITEM WANTED NOW STATE
+
+  local gov epp
+  if (( perf )); then gov="$CPU_GOVERNOR"; epp="$CPU_EPP"; else gov="${D_GOVERNOR:-}"; epp="${D_EPP:-}"; fi
+  if [[ -r "$cpu0/cpufreq/scaling_governor" ]]; then
+    have="$(cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor | sort | uniq -c | awk '{printf "%s%s", (NR>1?",":""), $2}')"
+    row "cpu governor ($(cat "$cpu0/cpufreq/scaling_driver" 2>/dev/null))" "$gov" "$have"
+  else
+    note "cpu governor: no cpufreq on this machine (VM?)"
+  fi
+  if [[ -r "$cpu0/cpufreq/energy_performance_preference" ]]; then
+    row "cpu energy preference" "$epp" "$(cat "$cpu0/cpufreq/energy_performance_preference")"
+  fi
+  f="$(boost_file)"
+  if [[ -n "$f" ]]; then
+    if (( perf )); then want="$CPU_BOOST"; else want="${D_BOOST:-}"; fi
+    row "cpu boost" "$want" "$(cat "$f")"
+  fi
+  local deepest=-1 maxidle=99
+  (( perf )) && maxidle="$CPU_MAX_IDLE_STATE"
+  for s in "$cpu0"/cpuidle/state[0-9]*; do
+    [[ -d "$s" ]] || continue
+    n="${s##*state}"
+    [[ "$(cat "$s/disable")" == 0 ]] && (( n > deepest )) && deepest=$n
+  done
+  if (( deepest >= 0 )); then
+    if (( perf )); then want="state<=${maxidle}"; else want="all"; fi
+    if (( deepest <= maxidle )) && (( perf )); then have="$want"
+    elif (( ! perf )) && [[ "$(cat "$cpu0"/cpuidle/state*/disable 2>/dev/null | grep -c '^1$')" == 0 ]]; then have=all
+    else have="deepest=state$deepest"; fi
+    row "cpu idle states" "$want" "$have"
+  fi
+  have="$(sed -n 's/.*\[\(.*\)\].*/\1/p' /sys/kernel/mm/transparent_hugepage/enabled)"
+  if (( perf )); then want="$THP_ENABLED"; else want="${D_THP_ENABLED:-}"; fi
+  row "transparent huge pages" "$want" "$have"
+  if (( perf )); then want="$NUMA_BALANCING"; else want="${D_NUMA_BALANCING:-}"; fi
+  row "numa balancing" "$want" "$(sysctl -n kernel.numa_balancing 2>/dev/null || echo n/a)"
+  if (( perf )); then want="$NMI_WATCHDOG"; else want="${D_NMI_WATCHDOG:-}"; fi
+  row "nmi watchdog" "$want" "$(sysctl -n kernel.nmi_watchdog 2>/dev/null || echo n/a)"
+  if (( perf )); then want="$NET_RMEM_MAX"; else want="${D_RMEM_MAX:-}"; fi
+  row "net.core.rmem_max" "$want" "$(sysctl -n net.core.rmem_max)"
+
+  for i in $(mesh_ifaces); do
+    have="$(ring_now "$i" rx current)/$(ring_now "$i" tx current)"
+    [[ "$have" == "/" ]] && continue
+    if (( perf )); then want="$(ring_now "$i" rx max)/$(ring_now "$i" tx max)"
+    else k="D_RING_${i//[^A-Za-z0-9]/_}"; want="${!k:-}"; want="${want/ //}"; fi
+    row "nic rings $i (rx/tx)" "$want" "$have"
+  done
+  for d in $(disks); do
+    if (( perf )); then
+      if [[ "$(cat "/sys/block/$d/queue/rotational")" == 0 ]]; then want="$SSD_SCHEDULER"; else want="$HDD_SCHEDULER"; fi
+    else k="D_SCHED_${d//[^A-Za-z0-9]/_}"; want="${!k:-}"; fi
+    row "disk scheduler $d" "$want" "$(sched_now "$d")"
+  done
+  d="$(shared_dev)"
+  if [[ -n "$d" ]]; then
+    if (( perf )); then want="$READ_AHEAD_KB"; else want="${D_RA_SHARED:-}"; fi
+    row "read-ahead /mnt/shared (KB)" "$want" "$(( $(blockdev --getra "$d") / 2 ))"
+  fi
+  if [[ "$ROLE" == head && -r /proc/fs/nfsd/threads ]]; then
+    if (( perf )); then want="$NFSD_THREADS"; else want="${D_NFSD_THREADS:-}"; fi
+    row "nfs server threads" "$want" "$(cat /proc/fs/nfsd/threads)"
+  fi
+  local noisy=()
+  # shellcheck disable=SC2086
+  for u in ${QUIET_UNITS}; do
+    unit_exists "$u" || continue
+    [[ "$(systemctl is-active "$u" 2>/dev/null)" == active || "$(systemctl is-enabled "$u" 2>/dev/null)" == enabled ]] && noisy+=("${u%.*}")
+  done
+  if (( perf )); then
+    row "background services" "none" "$( (( ${#noisy[@]} )) && echo "${noisy[*]}" || echo none)"
+  else
+    note "background services running: ${noisy[*]:-none}"
+  fi
+
+  want="$(cmdline_want)"
+  local tok missing=""
+  if (( perf )); then
+    for tok in $want; do grep -qw -- "$tok" /proc/cmdline || missing+=" $tok"; done
+    if [[ -n "$want" ]]; then
+      row "kernel cmdline" "$want" "$( [[ -z "$missing" ]] && echo "$want" || echo "missing:${missing}")" pending
+    fi
+  fi
+  if [[ -r /sys/devices/system/cpu/vulnerabilities/spectre_v2 ]]; then
+    note "spectre_v2: $(cat /sys/devices/system/cpu/vulnerabilities/spectre_v2)"
+  fi
+  note "cpu MHz now (min/avg/max): $(awk -F: '/cpu MHz/ {v=$2+0; s+=v; n++; if(min==""||v<min)min=v; if(v>max)max=v} END {if(n) printf "%.0f/%.0f/%.0f", min, s/n, max; else print "n/a"}' /proc/cpuinfo)"
+  note "limits: memlock=$(ulimit -l) stack=$(ulimit -s) nofile=$(ulimit -n)  (new logins get $LIMIT_MEMLOCK/$LIMIT_STACK/$LIMIT_NOFILE)"
+  if [[ "${missing:-}" != "" ]]; then note "PENDING = takes effect after a reboot"; fi
+}
+
+# ---------------------------------------------------------------------------
+# run on all three nodes
+# ---------------------------------------------------------------------------
+on_all() {
+  local n who="${SUDO_USER:-$USER}" rc=0 me
+  me="${NODE_NAME:-}"
+  "$0" "$@" || rc=1
+  for n in node1 node2 node3; do
+    [[ "$n" == "$me" ]] && continue
+    if [[ "$1" == status ]]; then
+      sudo -u "$who" -H ssh -o BatchMode=yes -o ConnectTimeout=5 "$n" /usr/local/sbin/perf-mode "$@" || rc=1
+    else
+      sudo -u "$who" -H ssh -o BatchMode=yes -o ConnectTimeout=5 "$n" sudo -n /usr/local/sbin/perf-mode "$@" || rc=1
+    fi
+  done
+  return $rc
+}
+
+all=0; check=0; args=()
+for a in "$@"; do
+  case "$a" in
+    --all) all=1 ;;
+    --check) check=1; args+=("$a") ;;
+    *) args+=("$a") ;;
+  esac
+done
+set -- "${args[@]+"${args[@]}"}"
+if (( all )); then
+  [[ "${1:-}" == status ]] || need_root
+  on_all "$@"; exit $?
+fi
+
+case "${1:-status}" in
+  status)
+    do_status
+    (( check && BAD )) && exit 1
+    exit 0 ;;
+  performance|default)
+    apply_mode "$1"
+    echo "$(hostname): now in $1 mode"
+    do_status ;;
+  boot)
+    mode="$(cat "$STATE" 2>/dev/null || echo "${PERF_MODE_DEFAULT:-performance}")"
+    apply_mode "$mode"
+    echo "perf-mode: applied $mode at boot" ;;
+  install) do_install ;;
+  dropcaches)
+    need_root; sync; echo 3 > /proc/sys/vm/drop_caches; echo "$(hostname): page cache dropped" ;;
+  -h|--help|help) sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//' ;;
+  *) die "unknown command '$1' (perf-mode help)" ;;
+esac

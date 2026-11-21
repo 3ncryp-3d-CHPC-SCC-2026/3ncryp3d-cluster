@@ -147,6 +147,13 @@ echo "=== 8. team accounts: hostnames and per-node bundles (expect VPN key on no
 run_console "8a. console mode build with config/team.conf" "$WORK/console-pass.txt" >/dev/null
 for n in node1 node2 node3; do teamcheck "$WORK/repo/state/3n3d-test/$n.yaml"; done
 echo "  user-data limit is 65535 bytes (Nova)"
+# the compressed bootstrap must unpack to exactly the repo's script
+boot="$(awk '/cluster-bootstrap.sh/{f=1} f&&/content:/{print $2; exit}' "$WORK/repo/state/3n3d-test/node3.yaml")"
+if base64 -d <<<"$boot" | gunzip | cmp -s - "$REPO/node/cluster-bootstrap.sh"; then
+  echo "  gz+b64 bootstrap in node3.yaml unpacks to node/cluster-bootstrap.sh: OK"
+else
+  echo "  gz+b64 bootstrap in node3.yaml does NOT match node/cluster-bootstrap.sh"
+fi
 
 echo
 echo "=== 9. TEAM_ACCOUNTS=no keeps the old build"

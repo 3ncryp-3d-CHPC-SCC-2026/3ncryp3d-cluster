@@ -65,6 +65,7 @@ then node1 and node2. Mesh links use MTU 9000 there. Steps are at the top of
 - [`benchmarks/io500/`](benchmarks/io500/): IO500 ISC26 v2 build, run and storage notes
 - [`tools/fetch_sources.sh`](tools/fetch_sources.sh): download every source and model for offline use
 - [`cases/`](cases/): our own practice cases (WRF CONUS, SPECFEM3D LA basin, llama.cpp 70B, OPEM sweep, ExaHyPE 2, IO500 variants) sized to stress 3 nodes, plus failure drills
+- [`docs/performance.md`](docs/performance.md): BIOS profile pushed through iLO ([`laptop/bios-profile.ps1`](laptop/bios-profile.ps1), [`config/bios-profile.conf`](config/bios-profile.conf)) and Linux tuning (`perf-mode`, [`config/tuning.conf`](config/tuning.conf)), with what to expect
 - [`docs/team-access.md`](docs/team-access.md): team accounts, keys-only SSH, WireGuard VPN, the Windows laptop script ([`laptop/setup-laptop.ps1`](laptop/setup-laptop.ps1)), lost-laptop steps. Settings in [`config/team.conf`](config/team.conf)
 - [`docs/openstack-test-review.md`](docs/openstack-test-review.md): review of the Sebowa test-cluster plan, with a no-cloud dry run in [`tests/openstack-dryrun/`](tests/openstack-dryrun/)
 - [`docs/day1-runbook.md`](docs/day1-runbook.md): unboxing, cabling, iLO, BIOS, RAID, Ubuntu, bring-up, checklists

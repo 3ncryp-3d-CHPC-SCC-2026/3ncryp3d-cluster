@@ -60,8 +60,8 @@ die()  { printf '\033[1;31mERROR:\033[0m %s\n' "$*" >&2; exit 1; }
 : "${MIN_LINK_GBPS:=9}" "${MIN_NFS_MBPS:=600}" "${BOOTSTRAP_TIMEOUT_MIN:=40}"
 
 case "$REPORT_VIA" in
-  ssh) need=(openstack ssh ssh-keygen base64 awk) ;;
-  console) need=(openstack ssh-keygen base64 awk) ;;
+  ssh) need=(openstack ssh ssh-keygen base64 gzip awk) ;;
+  console) need=(openstack ssh-keygen base64 gzip awk) ;;
   *) die "REPORT_VIA must be 'ssh' or 'console' (got '$REPORT_VIA')" ;;
 esac
 for cmd in "${need[@]}"; do
@@ -303,9 +303,12 @@ done
 
 # ---------------------------------------------------------------------------
 log "Cloud-init user-data per node"
-BOOT_B64="$(b64 "$HERE/node/cluster-bootstrap.sh")"
-VERIFY_B64="$(b64 "$HERE/node/verify-cluster.sh")"
-REPORT_B64="$(b64 "$HERE/node/console-report.sh")"
+# Scripts travel gzip-compressed (cloud-init unpacks "gz+b64"): Nova caps
+# user-data at 64 KB and node3's grows with every phase.
+gzb64() { gzip -9nc < "$1" | base64 | tr -d '\n'; }
+BOOT_B64="$(gzb64 "$HERE/node/cluster-bootstrap.sh")"
+VERIFY_B64="$(gzb64 "$HERE/node/verify-cluster.sh")"
+REPORT_B64="$(gzb64 "$HERE/node/console-report.sh")"
 KEY_B64="$(b64 "$STATE/cluster_ed25519")"
 PUB_B64="$(b64 "$STATE/cluster_ed25519.pub")"
 
@@ -341,7 +344,7 @@ write_files:
     content: ${PUB_B64}
   - path: /usr/local/sbin/cluster-bootstrap.sh
     permissions: '0755'
-    encoding: b64
+    encoding: gz+b64
     content: ${BOOT_B64}
 ${team}
 ${extra}
@@ -386,11 +389,11 @@ REPORT_VIA=${REPORT_VIA}
 BOOTSTRAP_TIMEOUT_MIN=${BOOTSTRAP_TIMEOUT_MIN}" "$STATE/node3.yaml" \
 "  - path: /usr/local/bin/verify-cluster.sh
     permissions: '0755'
-    encoding: b64
+    encoding: gz+b64
     content: ${VERIFY_B64}
   - path: /usr/local/sbin/console-report.sh
     permissions: '0755'
-    encoding: b64
+    encoding: gz+b64
     content: ${REPORT_B64}
   - path: /etc/cluster/targets.env
     permissions: '0644'

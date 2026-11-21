@@ -1,0 +1,135 @@
+#!/bin/bash
+# team-key - manage team members' LAPTOP keys on all three nodes at once.
+#
+#   team-key list                     who can log in, with key fingerprints
+#   sudo team-key add USER FILE.pub   allow one more laptop key for USER
+#   sudo team-key revoke USER         lost/stolen laptop: remove all of USER's
+#                                     laptop keys and VPN access, everywhere
+#
+# Run as a team member with sudo (not as root directly): the other nodes are
+# reached with your own internal key. Internal node-to-node keys are never
+# touched. Existing sessions are not killed; check with `who`.
+# VPN access comes back after a revoke by putting the new WireGuard public key
+# in /etc/cluster/team/keys/wg/USER.pub on the head and re-running
+# sudo /etc/cluster/team/bin/team-setup.sh there.
+set -euo pipefail
+
+T=/etc/cluster/team
+KD=/etc/ssh/team_keys
+# shellcheck source=/dev/null
+. /etc/cluster/node.env
+
+die() { echo "team-key: $*" >&2; exit 1; }
+usage() { sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
+
+local_only=0
+if [[ "${1:-}" == --local ]]; then local_only=1; shift; fi
+cmd="${1:-}"; user="${2:-}"
+
+valid_user() {
+  [[ "$1" =~ ^[a-z_][a-z0-9_-]*$ && -f "$KD/$1" ]] || die "unknown user '$1' (no $KD/$1)"
+}
+
+do_list() {
+  local f u
+  for f in "$KD"/*; do
+    [[ -f "$f" ]] || continue
+    u="$(basename "$f")"
+    echo "$u:"
+    { grep -E '^(ssh-|ecdsa-|sk-)' "$f" || true; } | while read -r line; do
+      printf '  laptop  %s\n' "$(ssh-keygen -lf <(echo "$line") 2>/dev/null || echo '?')"
+    done
+    if grep -q '3ncryp3d-internal-' "$f"; then echo "  internal key (cables only)"; fi
+  done
+  if [[ "$ROLE" == head && -f /etc/wireguard/wg0.conf ]]; then
+    echo "VPN peers:"
+    grep '^# user:' /etc/wireguard/wg0.conf | sed 's/^# user:/  /'
+  fi
+}
+
+do_add_local() { # key text on stdin
+  local key
+  key="$(grep -E '^(ssh-|ecdsa-|sk-)' | head -1)"
+  [[ -n "$key" ]] || die "no public key given"
+  ssh-keygen -lf <(echo "$key") >/dev/null 2>&1 || die "not a valid SSH public key"
+  if grep -qxF "$key" "$KD/$user"; then
+    echo "$(hostname): key already present for $user"
+  else
+    echo "$key" >> "$KD/$user"
+    mkdir -p "$T/keys/ssh"
+    echo "$key" >> "$T/keys/ssh/$user.pub"
+    echo "$(hostname): added key for $user"
+  fi
+}
+
+do_revoke_local() {
+  # keep the header and the internal key, drop every laptop key
+  grep -vE '^(ssh-|ecdsa-|sk-)' "$KD/$user" > "$KD/$user.new" || true
+  chmod 644 "$KD/$user.new"
+  mv "$KD/$user.new" "$KD/$user"
+  rm -f "$T/keys/ssh/$user.pub"
+  if [[ "$ROLE" == head && -f /etc/wireguard/wg0.conf ]]; then
+    local pub=""
+    [[ -f "$T/keys/wg/$user.pub" ]] && pub="$(tr -d ' \r\n' < "$T/keys/wg/$user.pub")"
+    # drop the "# user: X" block up to the next blank line
+    awk -v u="# user: $user" '
+      $0 == u {skip=1; next}
+      skip && /^[[:space:]]*$/ {skip=0; next}
+      !skip' /etc/wireguard/wg0.conf > /etc/wireguard/wg0.conf.new
+    chmod 600 /etc/wireguard/wg0.conf.new
+    mv /etc/wireguard/wg0.conf.new /etc/wireguard/wg0.conf
+    if [[ -n "$pub" ]] && command -v wg >/dev/null; then
+      wg set wg0 peer "$pub" remove 2>/dev/null || true
+    fi
+    rm -f "$T/keys/wg/$user.pub"
+  fi
+  if [[ "$ROLE" == head ]]; then
+    echo "$(hostname): revoked laptop keys and VPN access for $user"
+  else
+    echo "$(hostname): revoked laptop keys for $user"
+  fi
+}
+
+peers() {
+  local n
+  for n in node1 node2 node3; do [[ "$n" != "$NODE_NAME" ]] && echo "$n"; done
+}
+
+# run the same change on the other two nodes as the calling team member
+remote() { # remote <stdin-file-or-empty> args...
+  local input="$1" n rc=0
+  shift
+  local who="${SUDO_USER:-}"
+  [[ -n "$who" && "$who" != root ]] || die "run with sudo as a team member, not as root directly"
+  for n in $(peers); do
+    if [[ -n "$input" ]]; then
+      # shellcheck disable=SC2024  # root reads the key file on purpose
+      sudo -u "$who" -H ssh -o BatchMode=yes -o ConnectTimeout=5 "$n" sudo -n /usr/local/sbin/team-key --local "$@" < "$input" || rc=1
+    else
+      sudo -u "$who" -H ssh -o BatchMode=yes -o ConnectTimeout=5 "$n" sudo -n /usr/local/sbin/team-key --local "$@" < /dev/null || rc=1
+    fi
+  done
+  (( rc == 0 )) || echo "team-key: WARNING: not every node was updated; re-run when they are reachable" >&2
+}
+
+case "$cmd" in
+  list) do_list ;;
+  add)
+    [[ $EUID -eq 0 ]] || die "use sudo"
+    valid_user "$user"
+    if (( local_only )); then do_add_local; exit 0; fi
+    file="${3:?usage: sudo team-key add USER FILE.pub}"
+    [[ -r "$file" ]] || die "cannot read $file"
+    grep -q "PRIVATE KEY" "$file" && die "$file is a PRIVATE key: never copy it anywhere; make a new pair"
+    do_add_local < "$file"
+    remote "$file" add "$user"
+    ;;
+  revoke)
+    [[ $EUID -eq 0 ]] || die "use sudo"
+    valid_user "$user"
+    do_revoke_local
+    (( local_only )) || remote "" revoke "$user"
+    echo "Sessions still open for $user (not killed):"; who | awk -v u="$user" '$1==u' || true
+    ;;
+  *) usage ;;
+esac

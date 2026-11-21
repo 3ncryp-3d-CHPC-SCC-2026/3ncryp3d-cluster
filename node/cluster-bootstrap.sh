@@ -12,6 +12,31 @@ exec > >(tee -a "$LOG") 2>&1
 . /etc/cluster/node.env
 
 DONE=/var/lib/cluster-bootstrap.done
+
+# Team accounts bundle (tools/team-bundle.sh): cloud-init delivers it as a
+# tarball, baremetal/install.sh unpacks it already. Optional: without it the
+# node is set up exactly as before (ubuntu only, node1/2/3 hostnames).
+TEAM_DIR=/etc/cluster/team
+if [[ -f /etc/cluster/team.tgz && ! -d "$TEAM_DIR" ]]; then
+  tar -xzf /etc/cluster/team.tgz -C /etc/cluster
+  chmod 700 "$TEAM_DIR"
+  rm -f /etc/cluster/team.tgz
+fi
+if [[ -f "$TEAM_DIR/team.conf" ]]; then
+  # shellcheck source=../config/team.conf
+  . "$TEAM_DIR/team.conf"
+fi
+HOST_PREFIX="${HOST_PREFIX:-}"
+NODE_ALIASES="${NODE_ALIASES:-}"
+# short name for a node (node3 -> head); the node name itself if none
+alias_of() {
+  local pair
+  for pair in $NODE_ALIASES; do
+    [[ "${pair%%=*}" == "$1" ]] && { echo "${pair#*=}"; return; }
+  done
+  echo "$1"
+}
+
 CU="${CLUSTER_USER:-ubuntu}"
 id "$CU" >/dev/null 2>&1 || { echo "user $CU does not exist"; exit 1; }
 MESH_SUBNETS="10.0.12.0/24,10.0.23.0/24,10.0.31.0/24"
@@ -224,11 +249,25 @@ sed -i '/# BEGIN 3ncryp3d/,/# END 3ncryp3d/d' /etc/hosts
   echo "# BEGIN 3ncryp3d"
   for h in $HOSTS; do
     IFS='|' read -r ip name <<< "$h"
-    echo "$ip $name ${name}.cluster"
+    extra=""
+    a="$(alias_of "$name")"
+    [[ "$a" != "$name" ]] && extra=" $a"
+    [[ -n "$HOST_PREFIX" ]] && extra+=" ${HOST_PREFIX}-${a}"
+    echo "$ip $name ${name}.cluster${extra}"
   done
   echo "# END 3ncryp3d"
 } >> /etc/hosts
-hostnamectl set-hostname "$NODE_NAME"
+# Hostname: 3ncryp3d-head / -c1 / -c2 with a team bundle, else node1/2/3.
+if [[ -n "$HOST_PREFIX" ]]; then
+  NEW_HOSTNAME="${HOST_PREFIX}-$(alias_of "$NODE_NAME")"
+else
+  NEW_HOSTNAME="$NODE_NAME"
+fi
+hostnamectl set-hostname "$NEW_HOSTNAME"
+# keep it: cloud-init would otherwise reset the hostname on every boot
+if [[ -d /etc/cloud/cloud.cfg.d ]]; then
+  echo "preserve_hostname: true" > /etc/cloud/cloud.cfg.d/99-cluster-hostname.cfg
+fi
 
 # ---------------------------------------------------------------------------
 # 2. Gateway (node3 only): forwarding + NAT + uplink firewall
@@ -241,27 +280,49 @@ EOF
   sysctl --system >/dev/null
   apt_retry update
   apt_retry install -y nftables
+  # What the venue uplink accepts (team.conf; defaults = the old behaviour)
+  uplink_rules="    iifname \$UPLINK tcp dport 22 accept"
+  [[ "${SSH_ON_UPLINK:-yes}" == yes ]] || uplink_rules="    # SSH on the uplink is off (SSH_ON_UPLINK=no): VPN only"
+  if [[ "${WG_ENABLE:-no}" == yes ]]; then
+    uplink_rules+=$'\n'"    iifname \$UPLINK udp dport ${WG_PORT:-51820} accept"
+  fi
+  if [[ "${MDNS:-no}" == yes ]]; then
+    uplink_rules+=$'\n'"    iifname \$UPLINK udp dport 5353 accept"
+  fi
   cat > /etc/nftables.conf <<EOF
 #!/usr/sbin/nft -f
-# 3ncryp+3d gateway: only SSH reaches node3 from the venue uplink.
-# Mesh links are a trusted zone, like the real DAC cables.
-flush ruleset
+# 3ncryp+3d gateway: only SSH (and the VPN, if enabled) reach node3 from the
+# venue uplink. Mesh links are a trusted zone, like the real DAC cables.
+# Only OUR tables are reset on reload (no "flush ruleset"), so fail2ban's
+# own table and its bans survive.
+table inet cluster_filter
+delete table inet cluster_filter
+table ip cluster_nat
+delete table ip cluster_nat
 define UPLINK = "${up_if}"
-table inet filter {
+table inet cluster_filter {
   chain input {
     type filter hook input priority 0; policy accept;
     iifname \$UPLINK ct state established,related accept
-    iifname \$UPLINK tcp dport 22 accept
+${uplink_rules}
     iifname \$UPLINK icmp type echo-request accept
     iifname \$UPLINK meta l4proto ipv6-icmp accept
     iifname \$UPLINK udp dport 68 accept
     iifname \$UPLINK drop
+    # VPN laptops reach SSH and ping on node3 and nothing else
+    iifname "wg0" ct state established,related accept
+    iifname "wg0" tcp dport 22 accept
+    iifname "wg0" icmp type echo-request accept
+    iifname "wg0" drop
   }
   chain forward {
     type filter hook forward priority 0; policy drop;
     # node1/node2 must never reach the cloud metadata service through
     # node3's NAT: node3's user-data holds the internal cluster SSH key
     ip daddr 169.254.169.254 drop
+    # VPN laptops reach node1/node2 only through SSH on node3 (ProxyJump)
+    iifname "wg0" drop
+    oifname "wg0" drop
     iifname != \$UPLINK oifname \$UPLINK accept
     iifname \$UPLINK ct state established,related accept
     # mesh <-> mesh: lets node1<->node2 traffic fail over through node3
@@ -275,7 +336,7 @@ table inet filter {
     ip6 daddr fe80::a9fe:a9fe meta skuid != 0 drop
   }
 }
-table ip nat {
+table ip cluster_nat {
   chain postrouting {
     type nat hook postrouting priority 100;
     oifname \$UPLINK masquerade
@@ -370,7 +431,10 @@ install -d -m 700 -o "$CU" -g "$CU" "$UH/.ssh"
 install -m 600 -o "$CU" -g "$CU" /etc/cluster/ssh/id_ed25519 "$UH/.ssh/id_ed25519"
 install -m 644 -o "$CU" -g "$CU" /etc/cluster/ssh/id_ed25519.pub "$UH/.ssh/id_ed25519.pub"
 touch "$UH/.ssh/authorized_keys"
-if ! grep -qF "$(cat /etc/cluster/ssh/id_ed25519.pub)" "$UH/.ssh/authorized_keys"; then
+# With a team bundle, team-setup.sh authorises this key in /etc/ssh/team_keys
+# with a from="cables only" limit, so it must not also sit here unlimited.
+if [[ ! -f "$TEAM_DIR/team.conf" ]] && \
+   ! grep -qF "$(cat /etc/cluster/ssh/id_ed25519.pub)" "$UH/.ssh/authorized_keys"; then
   cat /etc/cluster/ssh/id_ed25519.pub >> "$UH/.ssh/authorized_keys"
 fi
 cat > "$UH/.ssh/config" <<'EOF'
@@ -401,6 +465,14 @@ if [[ "$ROLE" == "head" ]]; then
     echo "node3 slots=${SLOTS}"
   } > /mnt/shared/hostfile
   chown "$CU:$CU" /mnt/shared/hostfile
+fi
+
+# ---------------------------------------------------------------------------
+# 8. Team accounts and access (only with a team bundle): users, keys, sshd
+#    lock-down, banner; on node3 also WireGuard, fail2ban and mDNS
+# ---------------------------------------------------------------------------
+if [[ -x "$TEAM_DIR/bin/team-setup.sh" ]]; then
+  "$TEAM_DIR/bin/team-setup.sh"
 fi
 
 date -Is > "$DONE"

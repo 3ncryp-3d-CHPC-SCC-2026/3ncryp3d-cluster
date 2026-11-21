@@ -54,7 +54,7 @@ die()  { printf '\033[1;31mERROR:\033[0m %s\n' "$*" >&2; exit 1; }
 : "${VENUE_NETWORK:=}" "${ALLOWED_SSH_CIDR:=}" "${REPORT_VIA:=ssh}"
 : "${SSH_PUBLIC_KEY_FILE:=$HOME/.ssh/id_ed25519.pub}" "${SSH_PRIVATE_KEY_FILE:=$HOME/.ssh/id_ed25519}"
 : "${LINK_12_CIDR:=10.0.12.0/24}" "${LINK_23_CIDR:=10.0.23.0/24}" "${LINK_31_CIDR:=10.0.31.0/24}"
-: "${MESH_PORT_SECURITY:=auto}"
+: "${MESH_PORT_SECURITY:=auto}" "${TEAM_ACCOUNTS:=yes}"
 : "${SHARED_DISKS:=2}" "${SHARED_DISK_GB:=480}" "${SHARED_VOLUME_TYPE:=}"
 : "${LOCAL_DISKS:=2}" "${LOCAL_DISK_GB:=300}" "${LOCAL_VOLUME_TYPE:=}"
 : "${MIN_LINK_GBPS:=9}" "${MIN_NFS_MBPS:=600}" "${BOOTSTRAP_TIMEOUT_MIN:=40}"
@@ -127,6 +127,23 @@ fi
 # Internal key for passwordless SSH between the nodes (stays in state/).
 if [[ ! -f "$STATE/cluster_ed25519" ]]; then
   ssh-keygen -q -t ed25519 -N "" -C "${PREFIX}-cluster" -f "$STATE/cluster_ed25519"
+fi
+
+# Team accounts (config/team.conf): users, laptop keys, hostnames, VPN.
+# TEAM_ACCOUNTS=no builds the old way (ubuntu only, node1/2/3).
+TEAM_HOSTNAMES=()
+if [[ "$TEAM_ACCOUNTS" == yes && -f "$HERE/config/team.conf" ]]; then
+  log "Team accounts from config/team.conf"
+  "$HERE/tools/make-team-secrets.sh" "$STATE/team" >&2
+  # shellcheck source=config/team.conf
+  HP="$(. "$HERE/config/team.conf"; echo "${HOST_PREFIX:-}")"
+  NA="$(. "$HERE/config/team.conf"; echo "${NODE_ALIASES:-}")"
+  for n in node1 node2 node3; do
+    a="$n"
+    for pair in $NA; do [[ "${pair%%=*}" == "$n" ]] && a="${pair#*=}"; done
+    TEAM_HOSTNAMES+=("${HP:+${HP}-}${a}")
+    "$HERE/tools/team-bundle.sh" "$STATE/team" "$n" > "$STATE/team-$n.tgz"
+  done
 fi
 
 # ---------------------------------------------------------------------------
@@ -294,12 +311,20 @@ PUB_B64="$(b64 "$STATE/cluster_ed25519.pub")"
 
 # userdata <node> <node.env contents> <outfile> [extra write_files yaml]
 userdata() {
-  local node="$1" env="$2" out="$3" extra="${4:-}" env_b64
+  local node="$1" env="$2" out="$3" extra="${4:-}" env_b64 hn="$1" team=""
   env_b64="$(printf '%s\n' "$env" | base64 | tr -d '\n')"
+  # team bundle: hostname 3ncryp3d-head/-c1/-c2 and the accounts tarball
+  if [[ -f "$STATE/team-${node}.tgz" ]]; then
+    hn="${TEAM_HOSTNAMES[${node#node} - 1]}"
+    team="  - path: /etc/cluster/team.tgz
+    permissions: '0600'
+    encoding: b64
+    content: $(b64 "$STATE/team-${node}.tgz")"
+  fi
   cat > "$out" <<EOF
 #cloud-config
-hostname: ${node}
-fqdn: ${node}.cluster
+hostname: ${hn}
+fqdn: ${hn}.cluster
 preserve_hostname: false
 write_files:
   - path: /etc/cluster/node.env
@@ -318,6 +343,7 @@ write_files:
     permissions: '0755'
     encoding: b64
     content: ${BOOT_B64}
+${team}
 ${extra}
 runcmd:
   - [ /usr/local/sbin/cluster-bootstrap.sh ]

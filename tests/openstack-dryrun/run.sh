@@ -127,3 +127,30 @@ sed -e "s|/etc/cluster/node.env|$SB/node.env|" -e "s|/dev/ttyS0 /dev/console|$SB
     "$REPO/node/console-report.sh" > "$SB/console-report.sh"
 PATH="$SB/bin:$PATH" bash "$SB/console-report.sh"
 cat "$SB/ttyS0"
+
+# ---------------------------------------------------------------------------
+# 8. Team accounts (config/team.conf) in the cloud-init user-data: hostnames,
+#    the per-node bundle, and that private keys only go where they belong.
+teamcheck() {  # teamcheck <node> <yaml>
+  local y="$1" b
+  b="$(awk '/\/etc\/cluster\/team.tgz/{f=1} f&&/content:/{print $2; exit}' "$y")"
+  if [[ -z "$b" ]]; then echo "  $(basename "$y"): no team bundle"; return; fi
+  printf '  %s: hostname=%s  user-data=%s bytes  bundle: ' "$(basename "$y")" \
+    "$(sed -n 's/^hostname: //p' "$y")" "$(wc -c < "$y")"
+  base64 -d <<<"$b" | tar -tzf - | grep -cE 'users/[^/]+_ed25519$' | tr -d '\n'
+  printf ' user keys, own host key=%s, VPN key=%s\n' \
+    "$(base64 -d <<<"$b" | tar -tzf - | grep -c 'hostkey/ssh_host_ed25519_key$')" \
+    "$(base64 -d <<<"$b" | tar -tzf - | grep -c 'wg/head.key')"
+}
+echo
+echo "=== 8. team accounts: hostnames and per-node bundles (expect VPN key on node3 only)"
+run_console "8a. console mode build with config/team.conf" "$WORK/console-pass.txt" >/dev/null
+for n in node1 node2 node3; do teamcheck "$WORK/repo/state/3n3d-test/$n.yaml"; done
+echo "  user-data limit is 65535 bytes (Nova)"
+
+echo
+echo "=== 9. TEAM_ACCOUNTS=no keeps the old build"
+echo 'TEAM_ACCOUNTS="no"' >> "$WORK/console.env"
+run_console "9a. console mode build without team accounts" "$WORK/console-pass.txt" >/dev/null
+for n in node1 node3; do teamcheck "$WORK/repo/state/3n3d-test/$n.yaml"; done
+grep -h '^hostname:' "$WORK/repo/state/3n3d-test/node3.yaml" | sed 's/^/  node3.yaml /'
